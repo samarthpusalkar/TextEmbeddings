@@ -3,7 +3,6 @@ import torch.nn as nn
 from transformers import BertModel, BertPreTrainedModel, BertConfig
 from typing import Optional, Union
 
-# 1. Custom configuration that stores extra parameters.
 class CustomBertConfig(BertConfig):
     def __init__(self, global_layer_index=5, global_dim=128, seq_length=512, **kwargs):
         super().__init__(**kwargs)
@@ -26,8 +25,6 @@ class CustomBertConfig(BertConfig):
     def from_pretrained(cls,pretrained_model_name_or_path: Union[str, os.PathLike],cache_dir: Optional[Union[str, os.PathLike]] = None,force_download: bool = False,local_files_only: bool = False,token: Optional[Union[str, bool]] = None,revision: str = "main",**kwargs):
         return BertConfig.from_pretrained(pretrained_model_name_or_path, cache_dir, force_download, local_files_only, token, revision, **kwargs)
 
-
-# 2. Custom global aggregator layer.
 class GlobalDenseAggregator(nn.Module):
     def __init__(self, seq_length, hidden_size, global_dim):
         super().__init__()
@@ -49,7 +46,6 @@ class GlobalDenseAggregator(nn.Module):
         # Inject global information into each token (here via addition).
         return hidden_states + injected
 
-# 3. Custom encoder that inserts the global aggregator after a specific layer.
 from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 
@@ -114,12 +110,7 @@ class CustomBertEncoder(BertEncoder):
             pooler_output=None,
         )
 
-    # @classmethod
-    # def from_pretrained(cls, pretrained_model_name_or_path):
-    #     return super().from_pretrained(path)
-
-# 4. Custom model for token classification.
-class CustomBertForTokenClassification(BertPreTrainedModel):
+class BertForSentenceEncodingsTraining(BertPreTrainedModel):
     # Tell Transformers to use our custom config class.
     config_class = CustomBertConfig
 
@@ -144,9 +135,8 @@ class CustomBertForTokenClassification(BertPreTrainedModel):
         logits = self.classifier(sequence_output)
         
         loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, self.num_labels), input_ids.view(-1))
         return (loss, logits) if loss is not None else logits
 
     @classmethod
@@ -161,7 +151,9 @@ class CustomBertForTokenClassification(BertPreTrainedModel):
         # Load base config.
         base_config = BertConfig.from_pretrained(pretrained_model_name_or_path)
         # Update with custom parameters.
-        for key in ["global_layer_index", "global_dim", "seq_length", "num_labels"]:
+        num_labels = base_config.vocab_size
+        base_config.num_labels = num_labels
+        for key in ["global_layer_index", "global_dim", "seq_length"]:
             if key in kwargs:
                 setattr(base_config, key, kwargs[key])
                 kwargs.pop(key)
