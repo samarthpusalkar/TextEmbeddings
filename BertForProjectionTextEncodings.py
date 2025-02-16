@@ -1,7 +1,7 @@
 import os
-import torch
 import torch.nn as nn
 from transformers import BertModel, BertPreTrainedModel, BertConfig
+from typing import Optional, Union
 
 # 1. Custom configuration that stores extra parameters.
 class CustomBertConfig(BertConfig):
@@ -21,6 +21,11 @@ class CustomBertConfig(BertConfig):
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
         return cls(**config_dict)
+    
+    @classmethod
+    def from_pretrained(cls,pretrained_model_name_or_path: Union[str, os.PathLike],cache_dir: Optional[Union[str, os.PathLike]] = None,force_download: bool = False,local_files_only: bool = False,token: Optional[Union[str, bool]] = None,revision: str = "main",**kwargs):
+        return BertConfig.from_pretrained(pretrained_model_name_or_path, cache_dir, force_download, local_files_only, token, revision, **kwargs)
+
 
 # 2. Custom global aggregator layer.
 class GlobalDenseAggregator(nn.Module):
@@ -109,6 +114,10 @@ class CustomBertEncoder(BertEncoder):
             pooler_output=None,
         )
 
+    # @classmethod
+    # def from_pretrained(cls, pretrained_model_name_or_path):
+    #     return super().from_pretrained(path)
+
 # 4. Custom model for token classification.
 class CustomBertForTokenClassification(BertPreTrainedModel):
     # Tell Transformers to use our custom config class.
@@ -152,16 +161,17 @@ class CustomBertForTokenClassification(BertPreTrainedModel):
         # Load base config.
         base_config = BertConfig.from_pretrained(pretrained_model_name_or_path)
         # Update with custom parameters.
-        for key in ["global_layer_index", "global_dim", "seq_length"]:
+        for key in ["global_layer_index", "global_dim", "seq_length", "num_labels"]:
             if key in kwargs:
                 setattr(base_config, key, kwargs[key])
+                kwargs.pop(key)
         # Create a custom config.
         custom_config = CustomBertConfig.from_dict(base_config.to_dict())
         # Instantiate the model.
         model = cls(custom_config)
         
         # Load pretrained weights for BERT parts.
-        pretrained_bert = BertModel.from_pretrained(pretrained_model_name_or_path, config=base_config)
+        pretrained_bert = BertModel.from_pretrained(pretrained_model_name_or_path, config=base_config, **kwargs)
         pretrained_state_dict = pretrained_bert.state_dict()
         model_bert_state_dict = model.bert.state_dict()
         # Only load matching keys.
@@ -173,12 +183,11 @@ class CustomBertForTokenClassification(BertPreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        Override the default from_pretrained to ensure that our custom configuration parameters
-        are properly loaded. When saving the model with save_pretrained, our custom config
-        (including global_layer_index, global_dim, and seq_length) is saved in the config file.
+        Custom from_pretrained that loads the config and then the state dict
+        from either a PyTorch or SafeTensors file, depending on the flag
+        `use_safetensors` passed via kwargs.
         """
-        # Call the parent class method.
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        model = super().from_pretrained(pretrained_model_name_or_path)
         return model
 
     def save_pretrained(self, save_directory, **kwargs):
