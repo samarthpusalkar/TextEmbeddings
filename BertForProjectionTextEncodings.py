@@ -1,62 +1,61 @@
+import os
+import torch
 import torch.nn as nn
-from transformers import BertPreTrainedModel, BertModel, BertConfig
-from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
-from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
+from transformers import BertModel, BertPreTrainedModel, BertConfig
 
-class GlobalDenseAggregator(nn.Module):
-    """
-    Aggregates all token representations (with fixed seq_length) into a single global vector,
-    then projects that vector back to token-level representations.
+# 1. Custom configuration that stores extra parameters.
+class CustomBertConfig(BertConfig):
+    def __init__(self, global_layer_index=5, global_dim=128, seq_length=512, **kwargs):
+        super().__init__(**kwargs)
+        self.global_layer_index = global_layer_index  # After which layer to inject our custom layer.
+        self.global_dim = global_dim                  # Dimension for our global vector.
+        self.seq_length = seq_length                  # Fixed sequence length.
     
-    Args:
-        seq_length (int): Fixed sequence length (e.g. 512)
-        hidden_size (int): Hidden size of BERT
-        global_dim (int): Dimension of the global vector (N)
-    """
+    def to_dict(self):
+        output = super().to_dict()
+        output["global_layer_index"] = self.global_layer_index
+        output["global_dim"] = self.global_dim
+        output["seq_length"] = self.seq_length
+        return output
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        return cls(**config_dict)
+
+# 2. Custom global aggregator layer.
+class GlobalDenseAggregator(nn.Module):
     def __init__(self, seq_length, hidden_size, global_dim):
         super().__init__()
         self.seq_length = seq_length
         self.hidden_size = hidden_size
         self.global_dim = global_dim
-        # Fully connect the flattened token representations to a global vector
         self.aggregator = nn.Linear(seq_length * hidden_size, global_dim)
-        # Fully connect the global vector back to the flattened token representation
         self.injector = nn.Linear(global_dim, seq_length * hidden_size)
         self.activation = nn.ReLU()
-
+    
     def forward(self, hidden_states):
         # hidden_states: (batch_size, seq_length, hidden_size)
         batch_size, seq_length, hidden_size = hidden_states.size()
-        # Ensure the sequence length is as expected
         assert seq_length == self.seq_length, f"Expected seq_length {self.seq_length}, got {seq_length}"
-        # Flatten tokens: (batch_size, seq_length * hidden_size)
-        flat = hidden_states.view(batch_size, -1)
-        # Get a global vector of shape (batch_size, global_dim)
-        global_vector = self.activation(self.aggregator(flat))
-        # Project back to token-level (flattened)
-        injected_flat = self.activation(self.injector(global_vector))
-        # Reshape to (batch_size, seq_length, hidden_size)
+        flat = hidden_states.view(batch_size, -1)  # (batch_size, seq_length * hidden_size)
+        global_vector = self.activation(self.aggregator(flat))  # (batch_size, global_dim)
+        injected_flat = self.activation(self.injector(global_vector))  # (batch_size, seq_length * hidden_size)
         injected = injected_flat.view(batch_size, seq_length, hidden_size)
-        # Combine the injected global information with the original hidden states (here via addition)
+        # Inject global information into each token (here via addition).
         return hidden_states + injected
 
+# 3. Custom encoder that inserts the global aggregator after a specific layer.
+from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
+from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
+
 class CustomBertEncoder(BertEncoder):
-    """
-    Custom encoder that, after a chosen layer (global_layer_index), injects a global dense vector.
-    
-    Args:
-        config: BertConfig
-        global_layer_index (int): Index of the layer after which to apply the global dense aggregator.
-        global_dim (int): The dimension N of the global vector.
-        seq_length (int): The fixed sequence length.
-    """
-    def __init__(self, config, global_layer_index, global_dim, seq_length):
+    def __init__(self, config):
         super().__init__(config)
-        self.global_layer_index = global_layer_index
-        self.global_dense = GlobalDenseAggregator(seq_length=seq_length,
+        self.global_layer_index = config.global_layer_index
+        self.global_dense = GlobalDenseAggregator(seq_length=config.seq_length,
                                                   hidden_size=config.hidden_size,
-                                                  global_dim=global_dim)
-        # Create the usual BERT layers
+                                                  global_dim=config.global_dim)
+        # Build the standard BERT layers.
         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
     
     def forward(
@@ -90,7 +89,7 @@ class CustomBertEncoder(BertEncoder):
             )
             hidden_states = layer_outputs[0]
             
-            # After the chosen layer index, apply the global dense aggregator
+            # Insert global aggregator after the specified layer.
             if i == self.global_layer_index:
                 hidden_states = self.global_dense(hidden_states)
             
@@ -101,7 +100,7 @@ class CustomBertEncoder(BertEncoder):
             all_hidden_states = all_hidden_states + (hidden_states,)
         
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+            return (hidden_states, all_hidden_states, all_attentions)
         
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -110,50 +109,82 @@ class CustomBertEncoder(BertEncoder):
             pooler_output=None,
         )
 
+# 4. Custom model for token classification.
 class CustomBertForTokenClassification(BertPreTrainedModel):
-    """
-    A BertForTokenClassification model with a custom global dense layer inserted in the encoder.
-    
-    Args:
-        config: BertConfig
-        global_layer_index (int): The encoder layer after which to inject the global dense layer.
-        global_dim (int): The size N of the global vector.
-        seq_length (int): The fixed context length (e.g. 512).
-    """
-    def __init__(self, config, global_layer_index, global_dim, seq_length):
-        global_layer_index = config.pop('global_layer_index')
-        global_dim = config.pop('global_vector_dim')
-        seq_length = config.pop('fixed_seq_length')
+    # Tell Transformers to use our custom config class.
+    config_class = CustomBertConfig
+
+    def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        
-        # Load the standard BERT model and then replace its encoder with our custom encoder.
+
+        # Load the base BERT model and replace its encoder with our custom encoder.
         self.bert = BertModel(config)
-        self.bert.encoder = CustomBertEncoder(config,
-                                              global_layer_index=global_layer_index,
-                                              global_dim=global_dim,
-                                              seq_length=seq_length)
-        # Classification head
+        self.bert.encoder = CustomBertEncoder(config)
+        
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        
-        # Initialize weights (using the method from BertPreTrainedModel)
         self.init_weights()
     
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
         outputs = self.bert(input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids)
-        # outputs.last_hidden_state shape: (batch_size, seq_length, hidden_size)
-        sequence_output = outputs.last_hidden_state
-        
+        sequence_output = outputs.last_hidden_state  # (batch_size, seq_length, hidden_size)
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
         
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            # Flatten the predictions and labels for token classification.
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-        
         return (loss, logits) if loss is not None else logits
+
+    @classmethod
+    def from_base_for_training(cls, pretrained_model_name_or_path, **kwargs):
+        """
+        Custom initialization for training.
+        1. Loads the base BERT config.
+        2. Injects custom parameters (global_layer_index, global_dim, seq_length).
+        3. Instantiates the custom model.
+        4. Loads matching pretrained weights into the BERT parts.
+        """
+        # Load base config.
+        base_config = BertConfig.from_pretrained(pretrained_model_name_or_path)
+        # Update with custom parameters.
+        for key in ["global_layer_index", "global_dim", "seq_length"]:
+            if key in kwargs:
+                setattr(base_config, key, kwargs[key])
+        # Create a custom config.
+        custom_config = CustomBertConfig.from_dict(base_config.to_dict())
+        # Instantiate the model.
+        model = cls(custom_config)
+        
+        # Load pretrained weights for BERT parts.
+        pretrained_bert = BertModel.from_pretrained(pretrained_model_name_or_path, config=base_config)
+        pretrained_state_dict = pretrained_bert.state_dict()
+        model_bert_state_dict = model.bert.state_dict()
+        # Only load matching keys.
+        filtered_state_dict = {k: v for k, v in pretrained_state_dict.items() if k in model_bert_state_dict}
+        model.bert.load_state_dict(filtered_state_dict, strict=False)
+        
+        return model
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """
+        Override the default from_pretrained to ensure that our custom configuration parameters
+        are properly loaded. When saving the model with save_pretrained, our custom config
+        (including global_layer_index, global_dim, and seq_length) is saved in the config file.
+        """
+        # Call the parent class method.
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        return model
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """
+        Override save_pretrained if needed. The default implementation saves the model's state_dict
+        and the config (via config.to_dict()), which already includes our custom parameters.
+        """
+        # You can add custom saving behavior here if necessary.
+        super().save_pretrained(save_directory, **kwargs)
