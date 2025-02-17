@@ -273,6 +273,7 @@ class BertForSentenceEncodingsTraining(BertForTokenClassification):
 
         loss = None
         if input_ids is not None:
+            input_ids = input_ids.float()
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), input_ids.view(-1))
 
