@@ -1,7 +1,9 @@
 import os
 import torch
-from transformers import BertModel, BertConfig, BertForTokenClassification, AutoTokenizer, BertTokenizer
-from typing import Optional, Union, Tuple, List
+from transformers import BertModel, BertConfig, BertForTokenClassification
+from transformers.models.bert.modeling_bert import BertEncoder
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, TokenClassifierOutput
+from typing import Optional, Union, Tuple
 import logging
 import numpy as np
 import copy
@@ -55,7 +57,6 @@ class GlobalDenseAggregator(torch.nn.Module):
         # Inject global information into each token (here via addition).
         return new_hidden_states
 
-
 class GlobalDenseEncoder(torch.nn.Module):
     def __init__(self, hidden_size, global_dim):
         super().__init__()
@@ -70,10 +71,6 @@ class GlobalDenseEncoder(torch.nn.Module):
         global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
         # Inject global information into each token (here via addition).
         return global_vector
-
-
-from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, TokenClassifierOutput
 
 class CustomBertEncoder(BertEncoder):
     def __init__(self, config):
