@@ -1,8 +1,11 @@
 import os
 import torch
-from transformers import BertModel, BertConfig, BertForTokenClassification
-from typing import Optional, Union, Tuple
+from transformers import BertModel, BertConfig, BertForTokenClassification, AutoTokenizer, BertTokenizer
+from typing import Optional, Union, Tuple, List
 import logging
+import numpy as np
+import copy
+
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +44,33 @@ class GlobalDenseAggregator(torch.nn.Module):
     
     def forward(self, hidden_states):
         # hidden_states: (batch_size, seq_length, hidden_size)
-        batch_size, seq_length, hidden_size = hidden_states.size()
+        batch_size, _, _ = hidden_states.size()
         # assert seq_length == self.seq_length, f"Expected seq_length {self.seq_length}, got {seq_length}"
         # flat = hidden_states.view(batch_size, -1)  # (batch_size, seq_length * hidden_size)
         # global_vector = self.activation(self.aggregator(flat))  # (batch_size, global_dim)
         cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
         global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
         upscale_decode = self.activation(self.upscale_decoder(global_vector))  # (batch_size, seq_length * hidden_size)
-        new_hidden_states = upscale_decode.view(batch_size, seq_length, hidden_size)
+        new_hidden_states = upscale_decode.view(batch_size, self.seq_length, self.hidden_size)
         # Inject global information into each token (here via addition).
         return new_hidden_states
+
+
+class GlobalDenseEncoder(torch.nn.Module):
+    def __init__(self, hidden_size, global_dim):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.global_dim = global_dim
+        # self.aggregator = torch.nn.Linear(seq_length * hidden_size, global_dim)
+        self.aggregator = torch.nn.Linear(hidden_size, global_dim)
+        self.activation = torch.nn.LeakyReLU()
+    
+    def forward(self, hidden_states):
+        cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
+        global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
+        # Inject global information into each token (here via addition).
+        return global_vector
+
 
 from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, TokenClassifierOutput
@@ -155,101 +175,62 @@ class CustomBertEncoder(BertEncoder):
             cross_attentions=all_cross_attentions,
         )
 
-class BertSentenceEncoder(BertEncoder):
-    def __init__(self, config):
+class BertSentenceEncoder(BertModel):
+    def __init__(self, config, tokenizer, device=None):
         super().__init__(config)
         self.global_layer_index = config.num_hidden_layers
-        self.global_dense = GlobalDenseAggregator(seq_length=config.seq_length,
-                                                  hidden_size=config.hidden_size,
-                                                  global_dim=config.global_dim)
+        self.global_dense = GlobalDenseEncoder(hidden_size=config.hidden_size,
+                                               global_dim=config.global_dim)
+        self.tokenizer = tokenizer
+        if device is None:
+            device = 'cpu'
+        try:
+            if self.__getattr__('device') is None:
+                self.to(device)
+        except:
+            self.to(device)
 
-
-    def forward(
+    def encode(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
-        return_dict: Optional[bool] = True,
-    ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        sentences,
+        batch_size: int = 32,
+        convert_to_numpy: bool = True,
+        convert_to_tensor: bool = False,
+        device: str = None):
+        if type(sentences)==str:
+            sentences = [sentences]
+        
+        if device!=None:
+            self.device = device
+            self.to(device)
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
+        tokenized_batches = []
+        for batch_i in range(0, len(sentences), batch_size):
+            batch = sentences[batch_i: batch_i+batch_size]
+            tokenized_batches.append(self.tokenizer(batch, return_tensors='pt', padding='max_length', max_length=512).to(self.device))
+        all_embeddings = []
+        with torch.no_grad():
+            for tokenized_batch in tokenized_batches:
+                encodings = self.global_dense(self(**tokenized_batch)[0])
+                all_embeddings.extend(encodings)
 
-        next_decoder_cache = () if use_cache else None
-        for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            layer_head_mask = head_mask[i] if head_mask is not None else None
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    layer_module.__call__,
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    past_key_value,
-                    output_attentions,
-                )
+        if convert_to_tensor:
+            if len(all_embeddings):
+                if isinstance(all_embeddings, np.ndarray):
+                    all_embeddings = torch.from_numpy(all_embeddings)
+                else:
+                    all_embeddings = torch.stack(all_embeddings)
             else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    past_key_value,
-                    output_attentions,
-                )
-
-            hidden_states = layer_outputs[0]
-            if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
-
-        encodings = self.global_dense(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(
-                v
-                for v in [
-                    hidden_states,
-                    next_decoder_cache,
-                    all_hidden_states,
-                    all_self_attentions,
-                    all_cross_attentions,
-                ]
-                if v is not None
-            )
-        return BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=hidden_states,
-            past_key_values=next_decoder_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-            cross_attentions=all_cross_attentions,
-        )
+                all_embeddings = torch.Tensor()
+        elif convert_to_numpy:
+            if not isinstance(all_embeddings, np.ndarray):
+                if all_embeddings and all_embeddings[0].dtype == torch.bfloat16:
+                    all_embeddings = np.asarray([emb.float().numpy() for emb in all_embeddings])
+                else:
+                    all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+        elif isinstance(all_embeddings, np.ndarray):
+            all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
+        return all_embeddings
 
 class BertForSentenceEncodingsTraining(BertForTokenClassification):
     # Tell Transformers to use our custom config class.
@@ -360,5 +341,28 @@ class BertForSentenceEncodingsTraining(BertForTokenClassification):
         # You can add custom saving behavior here if necessary.
         super().save_pretrained(save_directory, **kwargs)
         
-    def get_encoder(self):
-        pass
+    def get_encoder(self, tokenizer):
+        base_config = copy.copy(self.bert.config.to_dict())
+        # Update with custom parameters.
+        base_config['num_hidden_layers'] = base_config['global_layer_index'] + 1 # Due to zero based indexing
+        # base_config.num_attention_heads = base_config.global_layer_index
+        del base_config['id2label']
+        del base_config['label2id']
+        # Create a custom config.
+        encoder_config = BertConfig.from_dict(base_config)
+        encoder = BertSentenceEncoder(encoder_config, tokenizer)
+        hidden_size, global_dim = base_config['hidden_size'], base_config['global_dim']
+        dense_encoder_layer = GlobalDenseEncoder(hidden_size, global_dim)
+        dense_encoder_layer.aggregator = self.bert.encoder.global_dense.aggregator
+        dense_encoder_layer.activation = self.bert.encoder.global_dense.activation
+        encoder.global_dense = dense_encoder_layer
+        
+        encoder.embeddings = self.bert.embeddings
+        encoder.encoder.layer = self.bert.encoder.layer[:encoder.config.num_hidden_layers]
+        # self.encoder = self.bert(config)
+
+        encoder.pooler = self.bert.pooler if self.bert.pooler is not None else None
+
+        encoder.encode(['hi'])
+        
+        return encoder
