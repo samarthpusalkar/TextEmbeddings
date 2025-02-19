@@ -7,6 +7,7 @@ from typing import Optional, Union, Tuple
 import logging
 import numpy as np
 import copy
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,21 @@ class GlobalDenseEncoder(torch.nn.Module):
         # global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
         # Inject global information into each token (here via addition).
         return global_vector
+
+class GlobalDenseDecoder(torch.nn.Module):
+    def __init__(self, hidden_size, global_dim, seq_length):
+        super().__init__()
+        self.seq_length = seq_length
+        self.hidden_size = hidden_size
+        self.global_dim = global_dim
+        self.upscale_decoder = torch.nn.Linear(global_dim, seq_length * hidden_size)
+        self.activation = torch.nn.LeakyReLU()
+    
+    def forward(self, global_vector):
+        batch_size = global_vector.shape[0]
+        upscale_decode = self.activation(self.upscale_decoder(global_vector))  # (batch_size, seq_length * hidden_size)
+        new_hidden_states = upscale_decode.view(batch_size, self.seq_length, self.hidden_size)
+        return new_hidden_states
 
 class CustomBertEncoder(BertEncoder):
     def __init__(self, config):
@@ -199,6 +215,7 @@ class BertSentenceEncoder(BertModel):
         batch_size: int = 32,
         convert_to_numpy: bool = True,
         convert_to_tensor: bool = False,
+        output_last_hidden_state: bool = False,
         device: str = None):
         if type(sentences)==str:
             sentences = [sentences]
@@ -211,28 +228,101 @@ class BertSentenceEncoder(BertModel):
             batch = sentences[batch_i: batch_i+batch_size]
             tokenized_batches.append(self.tokenizer(batch, return_tensors='pt', padding='max_length', max_length=self.global_dense.seq_length).to(self.device))
         all_embeddings = []
+        last_hidden_states = []
         with torch.no_grad():
             for tokenized_batch in tokenized_batches:
-                encodings = self.global_dense(self(**tokenized_batch)[0])
+                last_hidden_state = self(**tokenized_batch)[0]
+                encodings = self.global_dense(last_hidden_state)
                 all_embeddings.extend(encodings)
+                if output_last_hidden_state:
+                    last_hidden_states.extend(last_hidden_state)
 
         if convert_to_tensor:
             if len(all_embeddings):
                 if isinstance(all_embeddings, np.ndarray):
                     all_embeddings = torch.from_numpy(all_embeddings)
+                    last_hidden_states = torch.from_numpy(last_hidden_states)
                 else:
                     all_embeddings = torch.stack(all_embeddings)
+                    last_hidden_states = torch.stack(last_hidden_states)
             else:
                 all_embeddings = torch.Tensor()
+                last_hidden_states = torch.Tensor()
         elif convert_to_numpy:
             if not isinstance(all_embeddings, np.ndarray):
                 if all_embeddings and all_embeddings[0].dtype == torch.bfloat16:
                     all_embeddings = np.asarray([emb.float().numpy() for emb in all_embeddings])
+                    last_hidden_states = np.asarray([emb.float().numpy() for emb in last_hidden_states])
                 else:
                     all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+                    last_hidden_states = np.asarray([emb.numpy() for emb in last_hidden_states])
         elif isinstance(all_embeddings, np.ndarray):
             all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
-        return all_embeddings
+            last_hidden_states = [torch.from_numpy(embedding) for embedding in last_hidden_states]
+        return (all_embeddings, last_hidden_states) if output_last_hidden_state else all_embeddings
+
+class BertSentenceDecoder(BertModel):
+    def __init__(self, config, tokenizer, device=None):
+        super().__init__(config)
+        self.global_layer_index = config.num_hidden_layers
+        self.global_dense = GlobalDenseDecoder(seq_length=config.seq_length,
+                                               hidden_size=config.hidden_size,
+                                               global_dim=config.global_dim)
+        self.tokenizer = tokenizer
+        self.dropout = torch.nn.Dropout()
+        self.classifier = torch.nn.Linear(in_features=config.hidden_size, out_features=tokenizer.vocab_size)
+        if device is None:
+            device = 'cpu'
+        try:
+            if self.__getattr__('device') is None:
+                self.to(device)
+        except:
+            self.to(device)
+    
+    def decode(
+        self,
+        global_vectors,
+        last_hidden_states,
+        batch_size: int = 32,
+        convert_to_tokens: bool = True,
+        device: str = None,
+        ):
+        if len(global_vectors.shape)==1:
+            global_vectors = [global_vectors]
+        
+        if device!=None:
+            self.to(device)
+
+        last_hidden_states = torch.from_numpy(np.array(last_hidden_states)).to(self.device)
+        global_vectors = torch.from_numpy(np.array(global_vectors)).to(self.device)
+        all_token_ids = []
+        with torch.no_grad():
+            for batch_idx in range(0,len(global_vectors), batch_size):
+                batch = global_vectors[batch_idx:batch_idx+batch_size]
+                encodings = self.global_dense(batch)
+                encodings = encodings + last_hidden_states[batch_idx:batch_idx+batch_size]
+                encoder_hidden_shape = (len(encodings), self.config.seq_length)
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+                encoder_extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                        encoder_attention_mask, float, tgt_len=self.config.seq_length
+                    )
+                encoder_outputs = self.encoder(
+                    encodings,
+                    attention_mask=encoder_extended_attention_mask,
+                    return_dict=self.config.use_return_dict)
+                sequence_output = encoder_outputs[0][0]
+                sequence_output = self.dropout(sequence_output)
+                tokensids = self.classifier(sequence_output).argmax(dim=-1)
+                all_token_ids.extend(tokensids)
+
+        decoded = None
+        if convert_to_tokens:
+            if len(all_token_ids):
+                decoded = self.tokenizer.convert_ids_to_tokens(all_token_ids)
+        else:
+            decoded = all_token_ids
+        return decoded
+
 
 class BertForSentenceEncodingsTraining(BertForTokenClassification):
     # Tell Transformers to use our custom config class.
@@ -370,3 +460,27 @@ class BertForSentenceEncodingsTraining(BertForTokenClassification):
         encoder.encode(['hi'])
         
         return encoder
+  
+    def get_decoder(self, tokenizer):
+        base_config = copy.copy(self.bert.config.to_dict())
+        # Update with custom parameters.
+        base_config['num_hidden_layers'] = base_config['global_layer_index'] + 1 # Due to zero based indexing
+        # base_config.num_attention_heads = base_config.global_layer_index
+        del base_config['id2label']
+        del base_config['label2id']
+        # Create a custom config.
+        encoder_config = BertConfig.from_dict(base_config)
+        decoder = BertSentenceDecoder(encoder_config, tokenizer)
+        hidden_size, global_dim = base_config['hidden_size'], base_config['global_dim']
+        dense_encoder_layer = GlobalDenseDecoder(hidden_size, global_dim, seq_length=base_config['seq_length'])
+        dense_encoder_layer.upscale_decoder = self.bert.encoder.global_dense.upscale_decoder
+        dense_encoder_layer.activation = self.bert.encoder.global_dense.activation
+        decoder.global_dense = dense_encoder_layer
+        
+        decoder.embeddings = self.bert.embeddings
+        decoder.encoder.layer = self.bert.encoder.layer[decoder.config.num_hidden_layers:]
+        # self.encoder = self.bert(config)
+        decoder.pooler = self.bert.pooler if self.bert.pooler is not None else None
+        decoder.dropout = self.dropout
+        decoder.classifier = self.classifier
+        return decoder
