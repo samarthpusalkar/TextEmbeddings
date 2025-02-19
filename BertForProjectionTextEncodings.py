@@ -39,36 +39,41 @@ class GlobalDenseAggregator(torch.nn.Module):
         self.seq_length = seq_length
         self.hidden_size = hidden_size
         self.global_dim = global_dim
-        # self.aggregator = torch.nn.Linear(seq_length * hidden_size, global_dim)
-        self.aggregator = torch.nn.Linear(hidden_size, global_dim)
+        self.aggregator = torch.nn.Linear(seq_length * hidden_size, global_dim)
+        # self.aggregator = torch.nn.Linear(hidden_size, global_dim)
         self.upscale_decoder = torch.nn.Linear(global_dim, seq_length * hidden_size)
         self.activation = torch.nn.LeakyReLU()
     
     def forward(self, hidden_states):
         # hidden_states: (batch_size, seq_length, hidden_size)
-        batch_size, _, _ = hidden_states.size()
-        # assert seq_length == self.seq_length, f"Expected seq_length {self.seq_length}, got {seq_length}"
-        # flat = hidden_states.view(batch_size, -1)  # (batch_size, seq_length * hidden_size)
-        # global_vector = self.activation(self.aggregator(flat))  # (batch_size, global_dim)
-        cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
-        global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
+        batch_size, seq_length, _ = hidden_states.size()
+        assert seq_length == self.seq_length, f"Expected seq_length {self.seq_length}, got {seq_length}"
+        flat = hidden_states.view(batch_size, -1)  # (batch_size, seq_length * hidden_size)
+        global_vector = self.activation(self.aggregator(flat))  # (batch_size, global_dim)
+        # cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
+        # global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
         upscale_decode = self.activation(self.upscale_decoder(global_vector))  # (batch_size, seq_length * hidden_size)
         new_hidden_states = upscale_decode.view(batch_size, self.seq_length, self.hidden_size)
         # Inject global information into each token (here via addition).
-        return new_hidden_states
+        return new_hidden_states +  hidden_states
 
 class GlobalDenseEncoder(torch.nn.Module):
-    def __init__(self, hidden_size, global_dim):
+    def __init__(self, hidden_size, global_dim, seq_length):
         super().__init__()
         self.hidden_size = hidden_size
         self.global_dim = global_dim
-        # self.aggregator = torch.nn.Linear(seq_length * hidden_size, global_dim)
-        self.aggregator = torch.nn.Linear(hidden_size, global_dim)
+        self.aggregator = torch.nn.Linear(seq_length * hidden_size, global_dim)
+        # self.aggregator = torch.nn.Linear(hidden_size, global_dim)
         self.activation = torch.nn.LeakyReLU()
+        self.seq_length = seq_length
     
     def forward(self, hidden_states):
-        cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
-        global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
+        batch_size, seq_length, _ = hidden_states.size()
+        assert seq_length == self.seq_length, f"Expected seq_length {self.seq_length}, got {seq_length}"
+        flat = hidden_states.view(batch_size, -1)  # (batch_size, seq_length * hidden_size)
+        global_vector = self.activation(self.aggregator(flat)) 
+        # cls_token = hidden_states[:,0,:]# (batch_size, seq_length * hidden_size)
+        # global_vector = self.activation(self.aggregator(cls_token))  # (batch_size, global_dim)
         # Inject global information into each token (here via addition).
         return global_vector
 
@@ -176,7 +181,8 @@ class BertSentenceEncoder(BertModel):
     def __init__(self, config, tokenizer, device=None):
         super().__init__(config)
         self.global_layer_index = config.num_hidden_layers
-        self.global_dense = GlobalDenseEncoder(hidden_size=config.hidden_size,
+        self.global_dense = GlobalDenseEncoder(seq_length=config.seq_length,
+                                               hidden_size=config.hidden_size,
                                                global_dim=config.global_dim)
         self.tokenizer = tokenizer
         if device is None:
@@ -198,13 +204,12 @@ class BertSentenceEncoder(BertModel):
             sentences = [sentences]
         
         if device!=None:
-            self.device = device
             self.to(device)
 
         tokenized_batches = []
         for batch_i in range(0, len(sentences), batch_size):
             batch = sentences[batch_i: batch_i+batch_size]
-            tokenized_batches.append(self.tokenizer(batch, return_tensors='pt', padding='max_length', max_length=512).to(self.device))
+            tokenized_batches.append(self.tokenizer(batch, return_tensors='pt', padding='max_length', max_length=self.global_dense.seq_length).to(self.device))
         all_embeddings = []
         with torch.no_grad():
             for tokenized_batch in tokenized_batches:
@@ -273,7 +278,8 @@ class BertForSentenceEncodingsTraining(BertForTokenClassification):
 
         loss = None
         if input_ids is not None:
-            input_ids = input_ids.float()
+            if self.device is not None and self.device!='cpu':
+                input_ids = input_ids.float()
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), input_ids.view(-1))
 
@@ -350,7 +356,7 @@ class BertForSentenceEncodingsTraining(BertForTokenClassification):
         encoder_config = BertConfig.from_dict(base_config)
         encoder = BertSentenceEncoder(encoder_config, tokenizer)
         hidden_size, global_dim = base_config['hidden_size'], base_config['global_dim']
-        dense_encoder_layer = GlobalDenseEncoder(hidden_size, global_dim)
+        dense_encoder_layer = GlobalDenseEncoder(hidden_size, global_dim, seq_length=base_config['seq_length'])
         dense_encoder_layer.aggregator = self.bert.encoder.global_dense.aggregator
         dense_encoder_layer.activation = self.bert.encoder.global_dense.activation
         encoder.global_dense = dense_encoder_layer
