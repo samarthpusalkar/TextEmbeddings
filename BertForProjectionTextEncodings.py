@@ -56,7 +56,7 @@ class GlobalDenseAggregator(torch.nn.Module):
         upscale_decode = self.activation(self.upscale_decoder(global_vector))  # (batch_size, seq_length * hidden_size)
         new_hidden_states = upscale_decode.view(batch_size, self.seq_length, self.hidden_size)
         # Inject global information into each token (here via addition).
-        return new_hidden_states +  hidden_states
+        return new_hidden_states*1
 
 class GlobalDenseEncoder(torch.nn.Module):
     def __init__(self, hidden_size, global_dim, seq_length):
@@ -282,7 +282,7 @@ class BertSentenceDecoder(BertModel):
     def decode(
         self,
         global_vectors,
-        last_hidden_states,
+        last_hidden_states = None,
         batch_size: int = 32,
         convert_to_tokens: bool = True,
         device: str = None,
@@ -293,6 +293,8 @@ class BertSentenceDecoder(BertModel):
         if device!=None:
             self.to(device)
 
+        if last_hidden_states is None:
+            last_hidden_states = np.random.randint(0,0,(batch_size, self.config.seq_length, self.config.hidden_size))
         last_hidden_states = torch.from_numpy(np.array(last_hidden_states)).to(self.device)
         global_vectors = torch.from_numpy(np.array(global_vectors)).to(self.device)
         all_token_ids = []
@@ -300,7 +302,7 @@ class BertSentenceDecoder(BertModel):
             for batch_idx in range(0,len(global_vectors), batch_size):
                 batch = global_vectors[batch_idx:batch_idx+batch_size]
                 encodings = self.global_dense(batch)
-                encodings = encodings + last_hidden_states[batch_idx:batch_idx+batch_size]
+                encodings = encodings #+ (last_hidden_states[batch_idx:batch_idx+batch_size])*0.3
                 encoder_hidden_shape = (len(encodings), self.config.seq_length)
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
                 encoder_extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
